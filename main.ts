@@ -8,9 +8,7 @@
  * @rote-frontmatter
  * ---
  * name: slop-surgeon
- * version: "0.1.0"
  * description: "Hunts down AI-generated dead code and orphan dependencies, verifies safe excision against your test suite, and commits a clean branch."
- * source: "https://github.com/modiqo/rote-playoffs"
  * parameters:
  * - name: target
  *   param_type: string
@@ -28,21 +26,8 @@
  *   default: false
  *   description: "Scan only without excising files"
  * metadata:
- *   version: "0.1.0"
- *   rote_version: "0.4.87"
- *   flow_type: sequential
  *   status: released
  *   format: typescript
- *   requires_endpoints: []
- *   requires_sessions: false
- *   contract:
- *     atomic: true
- *     input:
- *       type: none
- *     output:
- *       format: json
- *       destination: stdout
- *     composable: true
  *   discoverability:
  *     tags:
  *     - cleanup
@@ -50,15 +35,6 @@
  *     - dead-code
  *     - testing
  *     - git
- * steps:
- *   surgical_prune:
- *     type: process.exec
- *     argv:
- *     - python3
- *     - resources/slop_surgeon.py
- *     - --target
- *     - $target
- *     - --json
  * ---
  */
 
@@ -114,14 +90,15 @@ for (let i = 0; i < args.length; i++) {
   }
 }
 
-// Resolve python engine script inside resources directory
+// Resolve python engine script
 const currentDir = new URL(".", import.meta.url).pathname;
-let pythonScript = `${currentDir}resources/slop_surgeon.py`;
+let pythonScript = `${currentDir}slop_surgeon.py`;
 
+// Fallback lookup if not found in current directory
 try {
   await Deno.stat(pythonScript);
 } catch {
-  pythonScript = `${homeDir}/.rote/flows/slop-surgeon/resources/slop_surgeon.py`;
+  pythonScript = `${homeDir}/.rote/flows/slop-surgeon/slop_surgeon.py`;
 }
 
 const cmdArgs = ["python3", pythonScript, "--target", target, "--json"];
