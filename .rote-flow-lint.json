@@ -1,0 +1,9 @@
+{
+  "flow_name": "slop-surgeon",
+  "flow_path": "/Users/bombermac/.rote/flows/slop-surgeon/main.ts",
+  "static_checks_passed": true,
+  "runtime_checks_passed": true,
+  "violations": [],
+  "linted_at": "2026-09-03T14:49:28.652250Z",
+  "rote_version": "0.79.0"
+}

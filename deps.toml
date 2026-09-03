@@ -1,0 +1,11 @@
+schema_version = 1
+
+[[tools]]
+id = "python3"
+command = "python3"
+required = true
+
+[[tools]]
+id = "git"
+command = "git"
+required = true
