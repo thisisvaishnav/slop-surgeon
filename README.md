@@ -33,14 +33,14 @@ AI coding assistants often introduce orphan modules, dead utility files, and gho
 ### Using Rote Play
 
 ```bash
-# Run in the current directory
-rote play run slop-surgeon
+# Run directly from the Rote Registry
+rote play run vaishnav/slop-surgeon
 
 # Scan without excising (dry run)
-rote play run slop-surgeon --dry-run
+rote play run vaishnav/slop-surgeon --dry-run
 
 # Run on a specific target repository with custom test runner
-rote play run slop-surgeon --target ./my-app --test-cmd "npm test"
+rote play run vaishnav/slop-surgeon --target ./my-app --test-cmd "npm test"
 ```
 
 ### Standalone with Deno
