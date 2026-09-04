@@ -8,26 +8,41 @@
  * @rote-frontmatter
  * ---
  * name: slop-surgeon
- * description: "Hunts down AI-generated dead code and orphan dependencies, verifies safe excision against your test suite, and commits a clean branch."
+ * version: 0.1.0
+ * description: Hunts down AI-generated dead code and orphan dependencies, verifies safe excision against your test suite, and commits a clean branch.
+ * source: https://github.com/thisisvaishnav/slop-surgeon
  * parameters:
  * - name: target
  *   param_type: string
  *   required: false
- *   default: "."
- *   description: "Path to repository directory to inspect and prune"
+ *   default: .
+ *   description: Path to repository directory to inspect and prune
  * - name: test_cmd
  *   param_type: string
  *   required: false
- *   default: ""
- *   description: "Custom test command to run for safety gate (auto-detected if blank)"
+ *   default: ''
+ *   description: Custom test command to run for safety gate (auto-detected if blank)
  * - name: dry_run
  *   param_type: boolean
  *   required: false
  *   default: false
- *   description: "Scan only without excising files"
+ *   description: Scan only without excising files
  * metadata:
+ *   version: 0.2.0
+ *   rote_version: 0.4.87
+ *   flow_type: sequential
  *   status: released
  *   format: typescript
+ *   requires_endpoints: []
+ *   requires_sessions: false
+ *   contract:
+ *     atomic: true
+ *     input:
+ *       type: none
+ *     output:
+ *       format: json
+ *       destination: stdout
+ *     composable: true
  *   discoverability:
  *     tags:
  *     - cleanup
@@ -35,6 +50,15 @@
  *     - dead-code
  *     - testing
  *     - git
+ * steps:
+ *   surgical_prune:
+ *     type: process.exec
+ *     argv:
+ *     - python3
+ *     - '@resource{slop_surgeon.py}'
+ *     - --target
+ *     - $target
+ *     - --json
  * ---
  */
 
@@ -72,6 +96,7 @@ Examples:
 let target = ".";
 let testCmd: string | null = null;
 let dryRun = false;
+let noBranch = false;
 
 for (let i = 0; i < args.length; i++) {
   const arg = args[i];
@@ -85,6 +110,8 @@ for (let i = 0; i < args.length; i++) {
     testCmd = arg.split("=")[1];
   } else if (arg === "--dry-run") {
     dryRun = true;
+  } else if (arg === "--no-branch") {
+    noBranch = true;
   } else if (!arg.startsWith("-") && target === ".") {
     target = arg;
   }
@@ -92,13 +119,17 @@ for (let i = 0; i < args.length; i++) {
 
 // Resolve python engine script
 const currentDir = new URL(".", import.meta.url).pathname;
-let pythonScript = `${currentDir}slop_surgeon.py`;
+let pythonScript = `${currentDir}resources/slop_surgeon.py`;
 
-// Fallback lookup if not found in current directory
 try {
   await Deno.stat(pythonScript);
 } catch {
-  pythonScript = `${homeDir}/.rote/flows/slop-surgeon/slop_surgeon.py`;
+  pythonScript = `${currentDir}slop_surgeon.py`;
+  try {
+    await Deno.stat(pythonScript);
+  } catch {
+    pythonScript = `${homeDir}/.rote/flows/slop-surgeon/resources/slop_surgeon.py`;
+  }
 }
 
 const cmdArgs = ["python3", pythonScript, "--target", target, "--json"];
@@ -107,6 +138,9 @@ if (testCmd) {
 }
 if (dryRun) {
   cmdArgs.push("--dry-run");
+}
+if (noBranch) {
+  cmdArgs.push("--no-branch");
 }
 
 out.human("🔪 Initializing SlopSurgeon safe excision pipeline...\n");

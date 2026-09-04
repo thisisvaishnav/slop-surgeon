@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 class Colors:
     HEADER = "\033[95m"
@@ -29,7 +29,7 @@ class Colors:
     RESET = "\033[0m"
 
 
-def run_cmd(cmd: List[str], cwd: Path, capture_output: bool = True) -> Tuple[int, str, str]:
+def run_cmd(cmd: List[str], cwd: Path, capture_output: bool = True, timeout: int = 60) -> Tuple[int, str, str]:
     """Runs a shell command and returns (exit_code, stdout, stderr)."""
     try:
         res = subprocess.run(
@@ -37,11 +37,11 @@ def run_cmd(cmd: List[str], cwd: Path, capture_output: bool = True) -> Tuple[int
             cwd=str(cwd),
             text=True,
             capture_output=capture_output,
-            timeout=120,
+            timeout=timeout,
         )
         return res.returncode, res.stdout, res.stderr
     except subprocess.TimeoutExpired:
-        return -1, "", "Command timed out after 120s"
+        return -1, "", f"Command timed out after {timeout}s"
     except Exception as e:
         return -1, "", str(e)
 
@@ -73,15 +73,24 @@ class RepoScanner:
                 with open(self.target / "package.json", "r") as f:
                     pkg = json.load(f)
                 scripts = pkg.get("scripts", {})
+                pm = "pnpm" if (self.target / "pnpm-lock.yaml").exists() else "npm"
                 if "test" in scripts and "no test specified" not in scripts["test"]:
-                    return ["npm", "test", "--", "--passWithNoTests"] if "jest" in scripts["test"] else ["npm", "test"]
+                    return [pm, "test", "--", "--passWithNoTests"] if "jest" in scripts["test"] else [pm, "test"]
+                # Fallback gates for projects without a test script
+                for gate in ("check-types", "typecheck", "type-check", "build", "lint"):
+                    if gate in scripts:
+                        return [pm, "run", gate]
             except Exception:
                 pass
 
         if ecosystem in ("python", "mixed"):
-            code, _, _ = run_cmd(["which", "pytest"], self.target)
+            code, _, _ = run_cmd(["which", "pytest"], self.target, timeout=5)
             if code == 0:
                 return ["pytest", "-q"]
+            if (self.target / "tests").is_dir():
+                return ["python3", "-m", "unittest", "discover", "-s", "tests"]
+            if (self.target / "test").is_dir():
+                return ["python3", "-m", "unittest", "discover", "-s", "test"]
             return ["python3", "-m", "unittest", "discover"]
 
         return None
@@ -91,18 +100,24 @@ class RepoScanner:
         orphan_files: List[Path] = []
 
         if ecosystem in ("node", "mixed"):
-            # Try running knip if available
-            code, stdout, _ = run_cmd(["npx", "--yes", "knip", "--reporter", "json"], self.target)
-            if code in (0, 1) and stdout.strip().startswith("{"):
-                try:
-                    data = json.loads(stdout)
-                    files = data.get("files", [])
-                    for f in files:
-                        p = (self.target / f).resolve()
-                        if p.exists() and p.is_file():
-                            orphan_files.append(p)
-                except Exception:
-                    pass
+            # Check if knip is available locally or globally without network download
+            has_local_knip = (self.target / "node_modules" / ".bin" / "knip").exists()
+            code, _, _ = run_cmd(["which", "knip"], self.target, timeout=5)
+            has_global_knip = (code == 0)
+
+            if has_local_knip or has_global_knip:
+                knip_bin = str(self.target / "node_modules" / ".bin" / "knip") if has_local_knip else "knip"
+                code, stdout, _ = run_cmd([knip_bin, "--reporter", "json"], self.target, timeout=15)
+                if code in (0, 1) and stdout.strip().startswith("{"):
+                    try:
+                        data = json.loads(stdout)
+                        files = data.get("files", [])
+                        for f in files:
+                            p = (self.target / f).resolve()
+                            if p.exists() and p.is_file():
+                                orphan_files.append(p)
+                    except Exception:
+                        pass
 
         # If no files found from external tools, run internal static reference scanner
         if not orphan_files:
@@ -112,7 +127,7 @@ class RepoScanner:
 
     def _internal_orphan_scan(self, ecosystem: str) -> List[Path]:
         """High-precision heuristic scanner for files not imported anywhere in project."""
-        ignore_dirs = {".git", "node_modules", ".next", "dist", "build", ".venv", "venv", "__pycache__", ".rote"}
+        ignore_dirs = {".git", "node_modules", ".next", "dist", "build", ".venv", "venv", "__pycache__", ".rote", ".turbo", ".vscode", ".cache"}
         all_sources: List[Path] = []
         extensions = (".ts", ".tsx", ".js", ".jsx") if ecosystem in ("node", "generic") else (".py",)
         if ecosystem == "mixed":
@@ -160,10 +175,12 @@ class RepoScanner:
 
 
 class SlopSurgeon:
-    def __init__(self, target_dir: Path, custom_test_cmd: Optional[str] = None, dry_run: bool = False):
+    def __init__(self, target_dir: Path, custom_test_cmd: Optional[str] = None, dry_run: bool = False, no_branch: bool = False, force: bool = False):
         self.target = target_dir.resolve()
         self.custom_test_cmd = shlex.split(custom_test_cmd) if custom_test_cmd else None
         self.dry_run = dry_run
+        self.no_branch = no_branch
+        self.force = force
         self.scanner = RepoScanner(self.target)
 
     def print_banner(self):
@@ -183,11 +200,19 @@ class SlopSurgeon:
         print(f"{Colors.BLUE}◆ Ecosystem:{Colors.RESET} {ecosystem.upper()}")
         print(f"{Colors.BLUE}◆ Test Verification Gate:{Colors.RESET} {' '.join(test_cmd) if test_cmd else 'None (Dry validation only)'}")
 
-        # Step 2: Baseline Git & Test Check
-        is_git = (self.target / ".git").exists()
-        branch_name = f"chore/slop-surgeon-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        # Safety Check: Refuse destructive excision if repo has no verification gate
+        if not test_cmd and not self.dry_run and not self.force:
+            print(f"\n{Colors.RED}❌ Safety Hazard: No test suite or typecheck gate detected in repository.{Colors.RESET}")
+            print(f"{Colors.YELLOW}   SlopSurgeon refuses to excise files blindly without a verification gate.{Colors.RESET}")
+            print(f"{Colors.YELLOW}   Run with --dry-run to audit, specify --test-cmd, or pass --force to bypass.{Colors.RESET}\n")
+            return {"error": "Missing safety gate", "message": "No test suite or typecheck gate found. Use --test-cmd or --force."}
 
-        if not self.dry_run and is_git:
+        # Step 2: Baseline Git Safety Guard
+        code, out, _ = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], self.target, timeout=5)
+        is_git = (code == 0 and out.strip() == "true")
+        branch_name = f"chore/slop-cleanup-{datetime.now().strftime('%Y%m%d-%H%M%S')}" if (is_git and not self.no_branch) else None
+
+        if not self.dry_run and is_git and branch_name:
             # Check for dirty tree
             _, status_out, _ = run_cmd(["git", "status", "--porcelain"], self.target)
             if status_out.strip():
@@ -198,6 +223,9 @@ class SlopSurgeon:
             code, _, err = run_cmd(["git", "checkout", "-b", branch_name], self.target)
             if code == 0:
                 print(f"{Colors.GREEN}✓ Created isolated surgery branch:{Colors.RESET} {branch_name}")
+            else:
+                print(f"{Colors.YELLOW}⚠️  Could not create branch ({err.strip()}). Proceeding on current branch.{Colors.RESET}")
+                branch_name = None
 
         # Step 3: Run Baseline Tests
         if test_cmd:
@@ -253,8 +281,8 @@ class SlopSurgeon:
             if tests_passed:
                 total_saved_lines += lines_count
                 if is_git:
-                    run_cmd(["git", "rm", "--cached", str(rel_path)], self.target)
-                    run_cmd(["git", "commit", "-am", f"chore(slop): excise dead file {rel_path} (tests verified green)"], self.target)
+                    run_cmd(["git", "add", "-A", str(candidate)], self.target)
+                    run_cmd(["git", "commit", "-m", f"chore(slop): excise dead file {rel_path} (tests verified green)"], self.target)
                 print(f" {Colors.GREEN}[EXCISED & VERIFIED PASS]{Colors.RESET}")
                 excised.append({
                     "file": str(rel_path),
@@ -263,8 +291,10 @@ class SlopSurgeon:
                     "status": "excised"
                 })
             else:
-                # Revert change
+                # Revert change immediately
                 candidate.write_text(content, encoding="utf-8")
+                if is_git:
+                    run_cmd(["git", "checkout", "--", str(candidate)], self.target)
                 print(f" {Colors.RED}[REVERTED: RUNTIME REGRESSION DETECTED]{Colors.RESET}")
                 retained.append({
                     "file": str(rel_path),
@@ -274,7 +304,7 @@ class SlopSurgeon:
 
         # Step 6: Generate Autopsy & Token Savings Certificate
         saved_tokens = total_saved_lines * 4  # heuristic ~4 tokens per line
-        self.print_summary(excised, retained, total_saved_lines, saved_tokens, branch_name if is_git else None)
+        self.print_summary(excised, retained, total_saved_lines, saved_tokens, branch_name)
 
         return {
             "status": "success",
@@ -282,20 +312,51 @@ class SlopSurgeon:
             "retained_count": len(retained),
             "saved_lines": total_saved_lines,
             "saved_tokens": saved_tokens,
-            "branch": branch_name if is_git else None
+            "branch": branch_name
         }
 
     def print_summary(self, excised: List[Dict], retained: List[Dict], lines: int, tokens: int, branch: Optional[str]):
-        print(f"\n{Colors.BOLD}{Colors.GREEN}============================================================={Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.GREEN}               SURGICAL AUTOPSY REPORT & CERTIFICATE         {Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.GREEN}============================================================={Colors.RESET}")
-        print(f"  • {Colors.BOLD}Files Successfully Excised:{Colors.RESET} {Colors.GREEN}{len(excised)}{Colors.RESET}")
-        print(f"  • {Colors.BOLD}Files Retained for Safety:{Colors.RESET}   {Colors.YELLOW}{len(retained)}{Colors.RESET}")
-        print(f"  • {Colors.BOLD}Dead Lines Eliminated:{Colors.RESET}       {Colors.CYAN}{lines} lines{Colors.RESET}")
-        print(f"  • {Colors.BOLD}Context Tokens Saved/Prompt:{Colors.RESET} {Colors.CYAN}~{tokens:,} tokens{Colors.RESET}")
+        w_total = 75
+        print(f"\n{Colors.BOLD}{Colors.GREEN}┌{'─' * w_total}┐{Colors.RESET}")
+        title = "SURGICAL AUTOPSY REPORT & CERTIFICATE"
+        pad_title = (w_total - len(title)) // 2
+        print(f"{Colors.BOLD}{Colors.GREEN}│{' ' * pad_title}{title}{' ' * (w_total - len(title) - pad_title)}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}├{'─' * 11}┬{'─' * 40}┬{'─' * 10}┬{'─' * 11}┤{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {'STATUS':<9} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {'CANDIDATE FILE':<38} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {'LINES':<8} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {'TOKENS':<9} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}├{'─' * 11}┼{'─' * 40}┼{'─' * 10}┼{'─' * 11}┤{Colors.RESET}")
+
+        for item in excised:
+            f_str = item['file']
+            if len(f_str) > 38:
+                f_str = "..." + f_str[-35:]
+            status_str = f"{Colors.GREEN}EXCISED{Colors.RESET}"
+            line_str = f"{item['lines']} lines"
+            tok_str = f"~{item['tokens']} tok"
+            # 18 chars for status with ANSI escape codes
+            print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {status_str:<18} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {f_str:<38} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {line_str:<8} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {tok_str:<9} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+
+        for item in retained:
+            f_str = item['file']
+            if len(f_str) > 38:
+                f_str = "..." + f_str[-35:]
+            status_str = f"{Colors.YELLOW}RETAINED{Colors.RESET}"
+            line_str = f"{item['lines']} lines"
+            tok_str = "(Safety)"
+            print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {status_str:<18} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {f_str:<38} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {line_str:<8} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET} {tok_str:<9} {Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+
+        print(f"{Colors.BOLD}{Colors.GREEN}├{'─' * w_total}┤{Colors.RESET}")
+        s1 = f"  • Files Successfully Excised: {len(excised)}"
+        s2 = f"  • Files Retained for Safety:   {len(retained)} (Regressions blocked)"
+        s3 = f"  • Dead Lines Eliminated:       {lines} lines"
+        s4 = f"  • Context Tokens Saved/Prompt: ~{tokens:,} tokens"
+        print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}{s1:<{w_total}}{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}{s2:<{w_total}}{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}{s3:<{w_total}}{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}{s4:<{w_total}}{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
         if branch:
-            print(f"  • {Colors.BOLD}Clean Git Branch:{Colors.RESET}            {Colors.BLUE}{branch}{Colors.RESET}")
-        print(f"{Colors.BOLD}{Colors.GREEN}============================================================={Colors.RESET}\n")
+            s5 = f"  • Isolated Git Branch:         {branch}"
+            print(f"{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}{s5:<{w_total}}{Colors.BOLD}{Colors.GREEN}│{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.GREEN}└{'─' * w_total}┘{Colors.RESET}\n")
 
 
 def main():
@@ -303,13 +364,17 @@ def main():
     parser.add_argument("--target", default=".", help="Target directory to inspect (default: .)")
     parser.add_argument("--test-cmd", default=None, help="Custom test command to verify against")
     parser.add_argument("--dry-run", action="store_true", help="Scan only without excising files")
+    parser.add_argument("--no-branch", action="store_true", help="Skip creating an isolated Git branch")
+    parser.add_argument("--force", action="store_true", help="Bypass missing test suite refusal and force excision")
     parser.add_argument("--json", action="store_true", help="Emit output as JSON")
 
     args = parser.parse_args()
     surgeon = SlopSurgeon(
         target_dir=Path(args.target),
         custom_test_cmd=args.test_cmd,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        no_branch=args.no_branch,
+        force=args.force
     )
     result = surgeon.run()
 
